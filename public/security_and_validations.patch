@@ -1,0 +1,260 @@
+diff --git a/src/main/java/pksmatches/service/MatchService.java b/src/main/java/pksmatches/service/MatchService.java
+index ac350a3..105af43 100644
+--- a/src/main/java/pksmatches/service/MatchService.java
++++ b/src/main/java/pksmatches/service/MatchService.java
+@@ -5,10 +5,15 @@ import pksmatches.model.Tournament;
+ import pksmatches.model.enums.MatchStatus;
+ import pksmatches.src.main.java.pksmatches.repository.MatchRepository;
+ 
++import java.time.Duration;
++import java.time.LocalDate;
++import java.time.format.DateTimeFormatter;
+ import java.util.List;
+ import java.util.Optional;
+ 
+ public class MatchService {
++
++    private static final DateTimeFormatter DT_FORMAT = DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm");
+     private final MatchRepository matchRepository;
+ 
+     public MatchService(MatchRepository matchRepository) {
+@@ -17,9 +22,52 @@ public class MatchService {
+ 
+     public void addMatch(Match match) {
+         if (match == null) throw new IllegalArgumentException("Матч не может быть null");
++        Tournament tournament = match.getTournament();
++        if (tournament == null) throw new IllegalArgumentException("Турнир обязателен");
++
++        LocalDate matchDate = match.getMatchDate().toLocalDate();
++
++        // 1. Валидация: дата матча должна быть в границах дат турнира
++        if (matchDate.isBefore(tournament.getStartDate()) || 
++            (tournament.getEndDate() != null && matchDate.isAfter(tournament.getEndDate()))) {
++            throw new IllegalArgumentException("Дата матча (" + matchDate + ") должна быть в пределах турнира (" 
++                    + tournament.getStartDate() + " — " + tournament.getEndDate() + ")");
++        }
++
++        // 2. Валидация: запрет добавления матча в завершившийся архивный турнир
++        if (tournament.getEndDate() != null && tournament.getEndDate().isBefore(LocalDate.now())) {
++            throw new IllegalStateException("Нельзя добавить матч: турнир уже завершился (" + tournament.getEndDate() + ")");
++        }
++
++        // 4. Защита от коллизии расписания (интервал < 3 часов у одной команды)
++        checkScheduleCollision(match);
++
+         matchRepository.save(match);
+     }
+ 
++    private void checkScheduleCollision(Match match) {
++        List<Match> all = matchRepository.findAll();
++        for (Match other : all) {
++            if (other.getStatus() == MatchStatus.CANCELLED) continue;
++            if (other.getId() == match.getId()) continue;
++
++            boolean hasTeam1 = match.getTeam1().equalsIgnoreCase(other.getTeam1()) || 
++                               match.getTeam1().equalsIgnoreCase(other.getTeam2());
++            boolean hasTeam2 = match.getTeam2().equalsIgnoreCase(other.getTeam1()) || 
++                               match.getTeam2().equalsIgnoreCase(other.getTeam2());
++
++            if (hasTeam1 || hasTeam2) {
++                long minutes = Math.abs(Duration.between(match.getMatchDate(), other.getMatchDate()).toMinutes());
++                if (minutes < 180) {
++                    String teamName = hasTeam1 ? match.getTeam1() : match.getTeam2();
++                    throw new IllegalStateException("Коллизия расписания: команда \"" + teamName + 
++                            "\" уже участвует в матче #" + other.getId() + " (" + 
++                            other.getMatchDate().format(DT_FORMAT) + "). Интервал должен быть не менее 3 часов");
++                }
++            }
++        }
++    }
++
+     public List<Match> getAllMatches() {
+         return matchRepository.findAll();
+     }
+@@ -61,15 +109,24 @@ public class MatchService {
+         if (m.getStatus() == MatchStatus.FINISHED) {
+             throw new IllegalStateException("Нельзя отменить завершённый матч");
+         }
++        if (m.getStatus() == MatchStatus.CANCELLED) {
++            throw new IllegalStateException("Матч уже отменён");
++        }
+         m.setStatus(MatchStatus.CANCELLED);
+         matchRepository.update(m);
+     }
+ 
+     public void updateScore(int id, int score1, int score2) {
+         Match m = getById(id);
++        if (m.getStatus() == MatchStatus.FINISHED) {
++            throw new IllegalStateException("Нельзя менять счёт завершённого матча");
++        }
+         if (m.getStatus() == MatchStatus.CANCELLED) {
+             throw new IllegalStateException("Нельзя менять счёт отменённого матча");
+         }
++        if (m.getStatus() == MatchStatus.SCHEDULED) {
++            throw new IllegalStateException("Нельзя менять счёт запланированного матча. Сначала начните матч");
++        }
+         m.setScore1(score1);
+         m.setScore2(score2);
+         matchRepository.update(m);
+@@ -80,4 +137,4 @@ public class MatchService {
+         matchRepository.deleteById(id);
+         return true;
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/src/main/java/pksmatches/service/UserService.java b/src/main/java/pksmatches/service/UserService.java
+index fa9c34d..799bfe2 100644
+--- a/src/main/java/pksmatches/service/UserService.java
++++ b/src/main/java/pksmatches/service/UserService.java
+@@ -4,6 +4,9 @@ import pksmatches.model.User;
+ import pksmatches.model.enums.UserRole;
+ import pksmatches.repository.UserRepository;
+ 
++import java.nio.charset.StandardCharsets;
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
+ import java.util.List;
+ import java.util.Optional;
+ 
+@@ -46,6 +49,20 @@ public class UserService {
+     }
+ 
+     private String hash(String password) {
+-        return Integer.toHexString(password.hashCode());
++        try {
++            MessageDigest digest = MessageDigest.getInstance("SHA-256");
++            byte[] encodedHash = digest.digest(password.getBytes(StandardCharsets.UTF_8));
++            StringBuilder hexString = new StringBuilder();
++            for (byte b : encodedHash) {
++                String hex = Integer.toHexString(0xff & b);
++                if (hex.length() == 1) {
++                    hexString.append('0');
++                }
++                hexString.append(hex);
++            }
++            return hexString.toString();
++        } catch (NoSuchAlgorithmException e) {
++            throw new RuntimeException("Ошибка алгоритма хэширования SHA-256", e);
++        }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/src/main/java/pksmatches/ui/ConsoleApp.java b/src/main/java/pksmatches/ui/ConsoleApp.java
+index 029ebcb..9b320e1 100644
+--- a/src/main/java/pksmatches/ui/ConsoleApp.java
++++ b/src/main/java/pksmatches/ui/ConsoleApp.java
+@@ -70,6 +70,7 @@ public class ConsoleApp {
+                 case 10 -> addTournament();
+                 case 11 -> listUsers();
+                 case 12 -> addUser();
++                case 13 -> logout();
+                 case 0 -> running = false;
+                 default -> System.out.println("Неверный пункт меню.");
+             }
+@@ -77,6 +78,18 @@ public class ConsoleApp {
+         System.out.println("До свидания.");
+     }
+ 
++        private void logout() {
++        System.out.println("Выход из профиля " + currentUser.getUsername() + ".");
++        currentUser = null;
++        while (currentUser == null) {
++            System.out.println();
++            System.out.println("=== Вход в систему ===");
++            if (!login()) {
++                System.out.println("Попробуйте снова.");
++            }
++        }
++    }
++
+     private void printMenu() {
+         System.out.println();
+         System.out.println("Пользователь: " + currentUser.getUsername()
+@@ -93,6 +106,7 @@ public class ConsoleApp {
+         System.out.println("10. Добавить турнир");
+         System.out.println("11. Список пользователей");
+         System.out.println("12. Добавить пользователя");
++        System.out.println("13. Сменить пользователя (Logout)");
+         System.out.println("0. Выход");
+     }
+ 
+@@ -140,7 +154,7 @@ public class ConsoleApp {
+             Match m = new Match(t, team1, team2, date, stage);
+             matchService.addMatch(m);
+             System.out.println("Матч добавлен. ID=" + m.getId());
+-        } catch (IllegalArgumentException e) {
++        } catch (IllegalArgumentException | IllegalStateException e) {
+             System.out.println("Ошибка: " + e.getMessage());
+         }
+     }
+@@ -335,24 +349,46 @@ public class ConsoleApp {
+         }
+     }
+ 
+-    private int readInt(String prompt) {
++        private static final int MAX_INPUT_LENGTH = 100;
++    private static final int MAX_SAFE_INT = 100_000;
++
++    private String readLineSafe(String prompt) {
+         while (true) {
+             System.out.print(prompt);
+-            String line = scanner.nextLine().trim();
++            String line = scanner.nextLine();
++            if (line.length() > MAX_INPUT_LENGTH) {
++                System.out.println("Ошибка: Неверный ввод (слишком длинное предложение, лимит " + MAX_INPUT_LENGTH + " символов). Ввод сброшен.");
++                continue;
++            }
++            return line.trim();
++        }
++    }
++
++    private int readInt(String prompt) {
++        while (true) {
++            String line = readLineSafe(prompt);
++            if (line.length() > 6) {
++                System.out.println("Ошибка: Неверный ввод (число слишком большое). Ввод сброшен.");
++                continue;
++            }
+             try {
+-                return Integer.parseInt(line);
++                int val = Integer.parseInt(line);
++                if (val < 0 || val > MAX_SAFE_INT) {
++                    System.out.println("Ошибка: Неверный ввод (число вне допустимого диапазона).");
++                    continue;
++                }
++                return val;
+             } catch (NumberFormatException e) {
+-                System.out.println("Введите целое число.");
++                System.out.println("Ошибка: Неверный ввод. Введите целое число.");
+             }
+         }
+     }
+ 
+     private String readNonEmpty(String prompt) {
+         while (true) {
+-            System.out.print(prompt);
+-            String line = scanner.nextLine().trim();
++            String line = readLineSafe(prompt);
+             if (!line.isEmpty()) return line;
+-            System.out.println("Поле не может быть пустым.");
++            System.out.println("Ошибка: Неверный ввод. Поле не может быть пустым.");
+         }
+     }
+ 
+diff --git a/src/main/resources/schema.sql b/src/main/resources/schema.sql
+index c916f8b..3b22812 100644
+--- a/src/main/resources/schema.sql
++++ b/src/main/resources/schema.sql
+@@ -46,8 +46,8 @@ CREATE TABLE matches (
+ 
+ -- Начальные тестовые данные (для проверки)
+ INSERT INTO users (username, password_hash, role) VALUES
+-    ('admin', '586034f', 'ADMIN'),
+-    ('user', '36ebcb', 'USER');
++    ('admin', '8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918', 'ADMIN'),
++    ('user', '04f8996da763b7a969b1028ee3007569eaf3a635486ddab211d512c85b9df8fb', 'USER');
+ 
+ INSERT INTO tournaments (name, start_date, end_date) VALUES
+     ('ЧМ по футболу 2024', '2024-06-01', '2024-07-15');

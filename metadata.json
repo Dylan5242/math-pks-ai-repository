@@ -1,0 +1,6 @@
+{
+  "name": "PKS Matches - Тестовая среда агрегатора матчей",
+  "description": "Облачная тестовая среда для проекта pks_matches (TheSkelies): управление турнирами, матчами, счетом, пользователями и эмулятор консольного приложения.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
